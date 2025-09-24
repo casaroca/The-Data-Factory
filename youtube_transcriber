@@ -1,0 +1,138 @@
+#!/bin/bash
+set -e
+
+echo "--- Setting up YouTube Transcriber ---"
+
+# --- 1. Define Paths ---
+PROJECT_DIR="/factory/workers/extractors/youtube_transcriber"
+LOG_DIR="/factory/logs"
+RAW_DUMP_DIR="/factory/data/raw/youtube_transcripts"
+USER="tdf"
+
+# --- 2. Create Directories ---
+echo "[+] Creating project and data directories..."
+mkdir -p $PROJECT_DIR
+mkdir -p $RAW_DUMP_DIR
+
+# --- 3. Create Application Files ---
+echo "[+] Creating YouTube Transcriber application files..."
+cat << 'EOF' > $PROJECT_DIR/youtube_transcriber.py
+import os
+import time
+import logging
+from youtube_transcript_api import YouTubeTranscriptApi
+from concurrent.futures import ThreadPoolExecutor
+import random
+
+# --- Configuration ---
+LOG_DIR = "/factory/logs"
+RAW_DUMP_DIR = "/factory/data/raw/youtube_transcripts"
+MAX_WORKERS = 8 # Increased from 5
+REST_PERIOD_SECONDS = 60 * 5 # 5 minutes
+
+# Expanded list of YouTube Video IDs to scrape
+VIDEO_IDS = [
+    # Original
+    '5__3_kN2z8g', # History of the World
+    '8_4-sW9_a2Q', # Intro to Quantum Computing
+    'k_nSg4Q62kU', # Economics Explained
+    'HAn91k2-b_I', # Philosophy: The Best Way to Live
+    'h_1-8aEj2-w',  # Artificial Intelligence Basics
+    # New Additions
+    '_d45-66q_Q',  # Crash Course World History
+    'rWp5s4O2mB8', # The whole history of the earth and life
+    'P1ww1IX4i1Q', # Richard Feynman on Quantum Mechanics
+    '_X-y_3-g_iM', # The Map of Mathematics
+    'XdddbYILack', # What is Evolution?
+    'zhL5DCizj5c', # The Industrial Revolution
+    'M2QfJp_1iA4', # How do computers read code?
+    'k-K8_204_lA', # The fundamentals of space-time
+    'vo4pMVb0R6M', # Introduction to Psychology
+    'wxa02-294F4', # History of the United States
+    'vfe-eNq-Qyg', # The Silk Road
+    'E43-CfukEgs', # Astrophysics for Beginners
+    '5pXxoyk5wOo', # The French Revolution
+    'bBC-nXj3Ng4', # How does a blockchain work
+    '1aRj-1g_V-w'  # The basics of classical architecture
+]
+
+# --- Setup Logging ---
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(filename=os.path.join(LOG_DIR, 'youtube_transcriber.log'), level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.getLogger('').addHandler(logging.StreamHandler())
+
+def get_and_save_transcript(video_id):
+    """Fetches a transcript for a single video and saves it."""
+    try:
+        logging.info(f"Fetching transcript for video ID: {video_id}")
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        
+        full_transcript = " ".join([item['text'] for item in transcript_list])
+        
+        # Sanitize the video_id to use as a filename
+        filename = f"youtube_{video_id}.txt"
+        output_path = os.path.join(RAW_DUMP_DIR, filename)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(full_transcript)
+            
+        logging.info(f"Successfully saved transcript for {video_id} to {output_path}")
+
+    except Exception as e:
+        logging.error(f"Could not fetch or save transcript for video ID {video_id}: {e}")
+
+def main():
+    while True:
+        logging.info("--- Starting new YouTube Transcriber cycle ---")
+        
+        # Select a random subset of videos to process each cycle
+        videos_to_process = random.sample(VIDEO_IDS, min(len(VIDEO_IDS), 5)) # Increased from 2 to 5
+        logging.info(f"Selected {len(videos_to_process)} videos for this cycle.")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(get_and_save_transcript, videos_to_process)
+            
+        logging.info(f"--- Cycle finished. Waiting {REST_PERIOD_SECONDS} seconds... ---")
+        time.sleep(REST_PERIOD_SECONDS)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+cat << 'EOF' > $PROJECT_DIR/requirements.txt
+youtube-transcript-api
+EOF
+
+# --- 4. Set Up Python Environment ---
+echo "[+] Setting up Python environment..."
+python3 -m venv $PROJECT_DIR/venv
+$PROJECT_DIR/venv/bin/pip install -r $PROJECT_DIR/requirements.txt
+
+# --- 5. Create Service File ---
+sudo bash -c "cat << EOF > /etc/systemd/system/youtube_transcriber.service
+[Unit]
+Description=YouTube Transcriber Service
+After=network.target
+
+[Service]
+User=$USER
+Group=$USER
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$PROJECT_DIR/venv/bin/python3 youtube_transcriber.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+
+# --- 6. Start the Service ---
+echo "[+] Starting YouTube Transcriber service..."
+sudo chown -R $USER:$USER /factory
+sudo systemctl daemon-reload
+sudo systemctl start youtube_transcriber
+sudo systemctl enable youtube_transcriber
+
+echo "--- YouTube Transcriber Setup Complete ---"
+echo "To check the status, run: sudo systemctl status youtube_transcriber"
+echo "To watch the logs, run: tail -f /factory/logs/youtube_transcriber.log"

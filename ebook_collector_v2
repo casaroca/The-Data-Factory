@@ -1,0 +1,190 @@
+#!/bin/bash
+set -e
+
+echo "--- Setting up Ebook Collector v3 ---"
+
+# --- 1. Stop and remove the old service to prevent conflicts ---
+echo "[+] Stopping and removing old ebook_collector_v2 service..."
+sudo systemctl stop ebook_collector_v2 || true
+sudo systemctl disable ebook_collector_v2 || true
+sudo rm -f /etc/systemd/system/ebook_collector_v2.service
+sudo rm -rf /factory/workers/collectors/ebook_collector_v2
+sudo systemctl daemon-reload
+
+# --- 2. Define Paths ---
+PROJECT_DIR="/factory/workers/collectors/ebook_collector_v3"
+LOG_DIR="/factory/logs"
+DEPOSIT_DIR="/factory/library/book_deposit"
+USER="tdf"
+
+# --- 3. Create Directories ---
+echo "[+] Creating project directories..."
+mkdir -p $PROJECT_DIR
+
+# --- 4. Create Application Files ---
+echo "[+] Creating ebook_collector_v3.py application file..."
+cat << 'EOF' > $PROJECT_DIR/ebook_collector_v3.py
+import os
+import time
+import logging
+import requests
+from bs4 import BeautifulSoup
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor
+
+# --- Configuration ---
+LOG_DIR = "/factory/logs"
+DEPOSIT_DIR = "/factory/library/book_deposit"
+MAX_WORKERS = 15
+REST_PERIOD_SECONDS = 60
+
+SOURCES = {
+    "gutenberg": {
+        "list_url": "https://www.gutenberg.org/browse/scores/top",
+        "base_url": "https://www.gutenberg.org"
+    },
+    "standard_ebooks": {
+        "list_url": "https://standardebooks.org/ebooks",
+        "base_url": "https://standardebooks.org"
+    },
+    "internet_archive_uoft": {
+        "list_url": "https://archive.org/details/university_of_toronto",
+        "base_url": "https://archive.org"
+    }
+}
+
+# --- Setup Logging ---
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(filename=os.path.join(LOG_DIR, 'ebook_collector_v3.log'), level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.getLogger('').addHandler(logging.StreamHandler())
+
+def get_ebook_links(source_config):
+    """Gets a list of ebook page links from a source."""
+    try:
+        logging.info(f"Fetching ebook list from: {source_config['list_url']}")
+        response = requests.get(source_config['list_url'], headers={'User-Agent': 'EbookCollector/3.0'})
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
+        links = set()
+        
+        if "gutenberg" in source_config['base_url']:
+            links.update(source_config['base_url'] + a['href'] for a in soup.find_all('a') if a.get('href', '').startswith('/ebooks/'))
+        elif "standardebooks" in source_config['base_url']:
+            links.update(a['href'] for a in soup.select('li.ebook-entry > a'))
+        elif "archive.org" in source_config['base_url']:
+            links.update(source_config['base_url'] + a['href'] for a in soup.select('div.tile-img a'))
+
+        return list(links)
+    except Exception as e:
+        logging.error(f"Could not fetch ebook list from {source_config['list_url']}: {e}")
+        return []
+
+def download_book(ebook_page_url):
+    """Visits an ebook page, finds the plain text link, and downloads the book."""
+    try:
+        logging.info(f"Processing book page: {ebook_page_url}")
+        response = requests.get(ebook_page_url, headers={'User-Agent': 'EbookCollector/3.0'})
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'lxml')
+
+        download_url = None
+        if "gutenberg.org" in ebook_page_url:
+            text_link = soup.find('a', string=re.compile(r'Plain Text UTF-8'))
+            if text_link:
+                download_url = "https:" + text_link['href'] if text_link['href'].startswith('//') else SOURCES['gutenberg']['base_url'] + text_link['href']
+        elif "standardebooks.org" in ebook_page_url:
+            text_link = soup.find('a', title=re.compile(r'Download the plain text source'))
+            if text_link:
+                download_url = text_link['href']
+        elif "archive.org" in ebook_page_url:
+            text_link = soup.find('a', string=re.compile(r'FULL TEXT', re.IGNORECASE))
+            if text_link:
+                download_url = SOURCES['internet_archive_uoft']['base_url'] + text_link['href']
+
+        if not download_url:
+            logging.warning(f"No plain text link found for {ebook_page_url}")
+            return
+
+        time.sleep(2)
+        book_content_response = requests.get(download_url, headers={'User-Agent': 'EbookCollector/3.0'})
+        book_content_response.raise_for_status()
+
+        title_match = re.search(r"Title:\s*(.+)", book_content_response.text)
+        if title_match:
+            title = title_match.group(1).strip()
+        else:
+            title = soup.find('h1').text.strip()
+        
+        filename = re.sub(r'[<>:"/\\|?*]', '_', title) + ".txt"
+        output_path = os.path.join(DEPOSIT_DIR, filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(book_content_response.text)
+        
+        logging.info(f"Successfully downloaded and saved: {output_path}")
+
+    except Exception as e:
+        logging.error(f"Failed to download book from {ebook_page_url}: {e}", exc_info=True)
+
+def main():
+    while True:
+        logging.info("--- Starting new Ebook Collector v3 cycle ---")
+        
+        all_links = []
+        for source_name, config in SOURCES.items():
+            all_links.extend(get_ebook_links(config))
+        
+        if all_links:
+            books_to_download = random.sample(all_links, min(len(all_links), 10))
+            logging.info(f"Selected {len(books_to_download)} books for this cycle.")
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(download_book, books_to_download)
+        
+        logging.info(f"--- Cycle finished. Waiting {REST_PERIOD_SECONDS} seconds... ---")
+        time.sleep(REST_PERIOD_SECONDS)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+cat << 'EOF' > $PROJECT_DIR/requirements.txt
+requests
+beautifulsoup4
+lxml
+EOF
+
+# --- 5. Set Up Python Environment ---
+echo "[+] Setting up Python environment..."
+python3 -m venv $PROJECT_DIR/venv
+$PROJECT_DIR/venv/bin/pip install -r $PROJECT_DIR/requirements.txt
+
+# --- 6. Create Service File ---
+echo "[+] Creating systemd service file..."
+sudo bash -c "cat << EOF > /etc/systemd/system/ebook_collector_v3.service
+[Unit]
+Description=Ebook Collector Service v3
+After=network.target
+
+[Service]
+User=$USER
+Group=$USER
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$PROJECT_DIR/venv/bin/python3 ebook_collector_v3.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+
+# --- 7. Start the Service ---
+echo "[+] Starting Ebook Collector v3 service..."
+sudo chown -R $USER:$USER /factory /library
+sudo systemctl daemon-reload
+sudo systemctl start ebook_collector_v3
+sudo systemctl enable ebook_collector_v3
+
+echo "--- Ebook Collector v3 Setup Complete ---"
+echo "To check the status, run: sudo systemctl status ebook_collector_v3"
+echo "To watch the logs, run: tail -f /factory/logs/ebook_collector_v3.log"

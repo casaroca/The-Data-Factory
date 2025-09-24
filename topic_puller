@@ -1,0 +1,185 @@
+#!/bin/bash
+set -e
+
+echo "--- Setting up The Topic Puller ---"
+
+# --- 1. Define Absolute Paths ---
+PROJECT_DIR="/factory/workers/extractors/topic_puller"
+LOG_DIR="/factory/logs"
+DB_PATH="/factory/db/library.db"
+RAW_DUMP_DIR="/factory/data/raw"
+# The library is now inside the factory on the single-drive setup
+LIBRARY_DIR="/factory/library/library"
+USER="tdf"
+
+# --- 2. Create Project Directory ---
+echo "[+] Creating project directory..."
+mkdir -p $PROJECT_DIR
+
+# --- 3. Create Application Files ---
+echo "[+] Creating Topic Puller application files..."
+cat << 'EOF' > $PROJECT_DIR/topic_puller.py
+import os
+import time
+import logging
+import re
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+
+# --- Configuration ---
+LOG_DIR = "/factory/logs"
+DB_PATH = "/factory/db/library.db"
+RAW_DUMP_DIR = "/factory/data/raw"
+LIBRARY_DIR = "/factory/library/library"
+MAX_WORKERS = 10
+DB_TIMEOUT = 30.0 # Wait a maximum of 30 seconds for the database
+
+TOPICS = {
+    "technology": ["software", "python", "computer", "network", "cybersecurity", "programming", "AI", "algorithm"],
+    "business": ["management", "marketing", "finance", "investment", "strategy", "economics", "startup"],
+    "science": ["physics", "biology", "chemistry", "astronomy", "research", "genetics", "environment"],
+    "history": ["history", "ancient", "war", "revolution", "historical", "biography"],
+    "language": ["language", "linguistics", "grammar", "spanish", "english", "translation"]
+}
+
+# --- Setup Logging ---
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(filename=os.path.join(LOG_DIR, 'topic_puller.log'), level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger('').addHandler(logging.StreamHandler())
+
+def init_database():
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("ALTER TABLE books ADD COLUMN processed_by_topic_puller BOOLEAN DEFAULT 0")
+                logging.info("Added 'processed_by_topic_puller' column to database.")
+            except sqlite3.OperationalError:
+                pass # Column already exists
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        logging.error(f"Database is locked, could not initialize: {e}")
+
+def get_unprocessed_books():
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, filepath FROM books WHERE processed_by_topic_puller = 0 LIMIT 100") # Process in batches of 100
+            return cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        logging.warning(f"Database is locked, cannot get new books this cycle: {e}")
+        return []
+
+def mark_book_as_processed(book_id):
+    try:
+        with sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE books SET processed_by_topic_puller = 1 WHERE id = ?", (book_id,))
+            conn.commit()
+    except sqlite3.OperationalError as e:
+        logging.error(f"Database is locked, could not mark book {book_id} as processed: {e}")
+
+def extract_text_from_epub(epub_path):
+    try:
+        book = epub.read_epub(epub_path)
+        content = ""
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_body_content(), 'lxml')
+            [s.decompose() for s in soup(['script', 'style'])]
+            content += soup.get_text('\n', strip=True) + "\n\n"
+        return content
+    except Exception as e:
+        logging.error(f"Could not read EPUB {epub_path}: {e}")
+        return ""
+
+def pull_topics_from_book(book_info):
+    book_id, filepath = book_info
+    if not os.path.exists(filepath):
+        logging.warning(f"File not found: {filepath}. Marking as processed.")
+        mark_book_as_processed(book_id)
+        return
+    
+    logging.info(f"Processing book: {filepath}")
+    full_text = extract_text_from_epub(filepath)
+    if not full_text:
+        mark_book_as_processed(book_id)
+        return
+
+    paragraphs = [p.strip() for p in full_text.split('\n') if len(p.strip()) > 100]
+    
+    for topic, keywords in TOPICS.items():
+        relevant_paragraphs = [p for p in paragraphs if any(kw in p.lower() for kw in keywords)]
+        if relevant_paragraphs:
+            output_content = "\n\n".join(relevant_paragraphs)
+            dir_path = os.path.join(RAW_DUMP_DIR, f"topic_{topic}")
+            os.makedirs(dir_path, exist_ok=True)
+            filename = f"{topic}_{os.path.splitext(os.path.basename(filepath))[0]}_{book_id}.txt"
+            output_filepath = os.path.join(dir_path, filename)
+            with open(output_filepath, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+            logging.info(f"Dumped {len(relevant_paragraphs)} paragraphs on '{topic}'")
+    
+    mark_book_as_processed(book_id)
+
+def main():
+    init_database()
+    while True:
+        logging.info("Topic Puller is checking for new books in the library...")
+        books_to_process = get_unprocessed_books()
+        
+        if books_to_process:
+            logging.info(f"Found {len(books_to_process)} new books to extract topics from.")
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(pull_topics_from_book, books_to_process)
+            logging.info(f"Finished processing batch.")
+        else:
+            logging.info("No new books to process. Waiting...")
+            time.sleep(60) # Only wait if the queue is empty
+
+if __name__ == "__main__":
+    main()
+EOF
+
+cat << 'EOF' > $PROJECT_DIR/requirements.txt
+EbookLib
+beautifulsoup4
+lxml
+EOF
+
+# --- 4. Set Up Python Environment ---
+echo "[+] Setting up Python environment..."
+python3 -m venv $PROJECT_DIR/venv
+$PROJECT_DIR/venv/bin/pip install -r $PROJECT_DIR/requirements.txt
+
+# --- 5. Create Service File ---
+echo "[+] Creating systemd service file..."
+sudo bash -c "cat << EOF > /etc/systemd/system/topic_puller.service
+[Unit]
+Description=Ebook Topic Puller Service
+After=network.target factory.mount
+
+[Service]
+User=$USER
+Group=$USER
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$PROJECT_DIR/venv/bin/python3 $PROJECT_DIR/topic_puller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+
+# --- 6. Start the Service ---
+echo "[+] Starting Topic Puller service..."
+sudo chown -R $USER:$USER /factory
+sudo systemctl daemon-reload
+sudo systemctl start topic_puller
+sudo systemctl enable topic_puller
+
+echo "--- Topic Puller Setup Complete ---"
+echo "To check the status, run: sudo systemctl status topic_puller"
+echo "To watch the logs, run: tail -f /factory/logs/topic_puller.log"

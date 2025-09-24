@@ -1,0 +1,122 @@
+import os
+import time
+import logging
+import requests
+from bs4 import BeautifulSoup
+import random
+import re
+import json
+from concurrent.futures import ThreadPoolExecutor
+from warcio.archiveiterator import ArchiveIterator
+import gzip
+import io
+
+# --- Configuration ---
+LOG_DIR = "/factory/logs"
+RAW_DUMP_DIR = "/factory/data/raw/common_crawl_query"
+MAX_WORKERS = 5
+REST_PERIOD_SECONDS = 10 # Updated rest period
+
+# High-quality domains to target
+TARGET_DOMAINS = [
+    "nytimes.com", "wsj.com", "theguardian.com", "bbc.com", "reuters.com",
+    "stackoverflow.com", "github.com", "hbr.org", "forbes.com", "techcrunch.com",
+    "mit.edu", "stanford.edu", "arxiv.org"
+]
+COLLINFO_URL = "http://index.commoncrawl.org/collinfo.json"
+
+# --- Setup Logging ---
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(filename=os.path.join(LOG_DIR, 'common_crawl_query_collector.log'), level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.getLogger('').addHandler(logging.StreamHandler())
+
+def get_latest_cc_index():
+    """Fetches the latest Common Crawl index from the collinfo.json file."""
+    try:
+        response = requests.get(COLLINFO_URL)
+        response.raise_for_status()
+        indexes = response.json()
+        # Find the latest index by id
+        latest_index = max(indexes, key=lambda x: x['id'])
+        return latest_index['cdx-api']
+    except Exception as e:
+        logging.error(f"Could not fetch latest Common Crawl index: {e}")
+        return None
+
+def get_warc_records_from_api(domain, cc_index_url):
+    """Queries the Common Crawl CDX API for a specific domain."""
+    if not cc_index_url:
+        return []
+    try:
+        # Corrected API query format - searching for a domain directly
+        search_url = f"{cc_index_url}?url=*.{domain}/*&output=json&limit=50"
+        logging.info(f"Querying Common Crawl API for domain: {domain}")
+        response = requests.get(search_url, headers={'User-Agent': 'CCQueryCollector/1.0'})
+        response.raise_for_status()
+        # Handle potential empty lines in response
+        records = [json.loads(line) for line in response.text.strip().split('\n') if line]
+        logging.info(f"API returned {len(records)} records for domain {domain}.")
+        return records
+    except Exception as e:
+        logging.error(f"Could not query CC API for domain {domain}: {e}")
+        return []
+
+def clean_html(html_content):
+    try:
+        soup = BeautifulSoup(html_content, 'lxml-xml')
+    except Exception:
+        soup = BeautifulSoup(html_content, 'lxml')
+    for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        element.extract()
+    main_content = soup.find('main') or soup.find('article') or soup.find('body')
+    return re.sub(r'\s+', ' ', main_content.get_text(strip=True)) if main_content else ""
+
+def fetch_and_process_warc(record):
+    """Downloads a WARC segment, extracts text, and saves it."""
+    try:
+        offset, length = int(record['offset']), int(record['length'])
+        url = f"https://data.commoncrawl.org/{record['filename']}"
+        headers = {'Range': f'bytes={offset}-{offset + length - 1}'}
+        
+        logging.info(f"Downloading WARC segment from: {url}")
+        warc_response = requests.get(url, headers=headers, stream=True, timeout=120)
+        warc_response.raise_for_status()
+
+        # Decompress gzipped content in memory
+        with gzip.GzipFile(fileobj=io.BytesIO(warc_response.content)) as gz:
+            for record_item in ArchiveIterator(gz):
+                if record_item.rec_type == 'response' and record_item.http_headers is not None and record_item.http_headers.get_statuscode() == '200':
+                    html = record_item.content_stream().read()
+                    clean_text = clean_html(html)
+                    if len(clean_text) > 200: # Basic quality filter
+                        filename = f"cc_query_{int(time.time() * 1000)}.txt"
+                        output_path = os.path.join(RAW_DUMP_DIR, filename)
+                        with open(output_path, 'w', encoding='utf-8') as f:
+                            f.write(clean_text)
+                        logging.info(f"Successfully extracted and saved text to {output_path}")
+                        return # Process only the first valid record in the segment
+
+    except Exception as e:
+        logging.error(f"Failed to process WARC record {record.get('url')}: {e}", exc_info=True)
+
+def main():
+    cc_index_url = get_latest_cc_index()
+    while True:
+        logging.info("--- Starting new Common Crawl Query Collector cycle ---")
+        
+        domain = random.choice(TARGET_DOMAINS)
+        
+        warc_records = get_warc_records_from_api(domain, cc_index_url)
+        
+        if warc_records:
+            items_to_process = random.sample(warc_records, min(len(warc_records), 10)) # Process more records
+            logging.info(f"Selected {len(items_to_process)} WARC records to process.")
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                executor.map(fetch_and_process_warc, items_to_process)
+        
+        logging.info(f"--- Cycle finished. Waiting {REST_PERIOD_SECONDS} seconds... ---")
+        time.sleep(REST_PERIOD_SECONDS)
+
+if __name__ == "__main__":
+    main()

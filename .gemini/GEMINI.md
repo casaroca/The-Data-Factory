@@ -1,0 +1,22 @@
+## Gemini Added Memories
+- The Data Factory VM audit is complete. All necessary information for replication has been gathered and saved to long-term memory.
+- The user will activate me in a different drive/directory in the future.
+- The worker 'data_transporter_setup' is unresolvable due to missing OVH credentials.
+- The worker 'ebook_collector_v3_setup' is unresolvable due to persistent lxml and certifi issues.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
+- The worker 'outlier_detector_v1_setup' is unresolvable due to a missing application file (outlier_detector_v1.py).
+- The worker 'stats_collector_v2_setup' is unresolvable due to persistent API authentication issues and script update problems.
+- The worker 'targeted_collector_setup' is unresolvable due to persistent lxml issues.
+- The worker 'targeted_collector_v2_setup' is unresolvable due to persistent lxml issues.
+- The worker 'targeted_collector_v4_setup' is unresolvable due to persistent lxml issues.
+- The worker 'targeted_collector_v5_setup' is unresolvable due to persistent lxml issues.
+- The worker 'targeted_collector_v6_setup' is unresolvable due to persistent lxml issues.
+- The worker 'youtube_transcriber_setup' is unresolvable due to a missing YouTube API key.
+- The worker 'youtube_transcriber_v3_setup' is unresolvable due to an invalid YouTube API key.
+- The worker 'business_collector_v5' is unresolvable due to persistent certifi issues.
+- The worker 'ebook_collector_v3_setup' is unresolvable due to persistent lxml and certifi issues.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
+- The worker 'nypl_collector_setup' is unresolvable due to an invalid API token.
